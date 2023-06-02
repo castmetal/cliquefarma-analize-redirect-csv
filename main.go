@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/castmetal/cliquefarma-analize-redirect-csv/logger"
-
 	inputhttp "github.com/castmetal/cliquefarma-analize-redirect-csv/http"
+	"github.com/castmetal/cliquefarma-analize-redirect-csv/logger"
+	"golang.org/x/time/rate"
 )
 
 type RowReader struct {
@@ -28,7 +28,7 @@ type RowReader struct {
 
 func NewRowReader(ctx context.Context, csvwriter *csv.Writer) RowReader {
 	return RowReader{
-		chRow:     make(chan []string, 100),
+		chRow:     make(chan []string, 200),
 		csvwriter: csvwriter,
 		mu:        sync.Mutex{},
 		ctx:       ctx,
@@ -95,7 +95,7 @@ func (r *RowReader) analyzeStatusAndWriteResponse(from string, to string, row []
 	defer r.mu.Unlock()
 
 	rowWritter := []string{
-		row[0], from, to, status, strStatusDe, strStatusPara,
+		fmt.Sprintf("%s\r", row[0]), fmt.Sprintf("%s\r", from), fmt.Sprintf("%s\r", to), fmt.Sprintf("%s\r", status), fmt.Sprintf("%s\r", strStatusDe), fmt.Sprintf("%s\r", strStatusPara),
 	}
 	_ = r.csvwriter.Write(rowWritter)
 
@@ -109,11 +109,7 @@ func (r *RowReader) verifyUrls(from string, to string) (int, int) {
 
 	wg.Add(1)
 	go func(requestStatus *int) {
-		data, status, _ := FetchHttp(r.ctx, from, "GET")
-
-		if data != nil {
-			data.Close()
-		}
+		status, _ := FetchHttp(r.ctx, from)
 
 		*requestStatus = status
 		wg.Done()
@@ -121,11 +117,7 @@ func (r *RowReader) verifyUrls(from string, to string) (int, int) {
 
 	wg.Add(1)
 	go func(requestStatus *int) {
-		data, status, _ := FetchHttp(r.ctx, to, "GET")
-
-		if data != nil {
-			data.Close()
-		}
+		status, _ := FetchHttp(r.ctx, to)
 
 		*requestStatus = status
 		wg.Done()
@@ -154,6 +146,8 @@ func main() {
 	}
 
 	csvwriter = csv.NewWriter(csvFile)
+	csvwriter.UseCRLF = true
+
 	empRow := []string{
 		"Sku", "De", "Para", "Status", "De Status", "Para Status",
 	}
@@ -165,10 +159,11 @@ func main() {
 	reader := csv.NewReader(file)
 	rowReader := NewRowReader(ctx, csvwriter)
 
-	for i := 0; i <= 20; i++ {
+	for i := 0; i <= 50; i++ {
 		go rowReader.consumeRow()
 	}
 
+	limiter := rate.NewLimiter(rate.Limit(100), 1)
 	i := 0
 	for {
 		record, err := reader.Read()
@@ -184,13 +179,51 @@ func main() {
 			continue
 		}
 
+		if err := limiter.Wait(ctx); err != nil {
+			logger.Error(ctx, err, "rate limit exceeded")
+			time.Sleep(5 * time.Second)
+		}
+
 		rowReader.chRow <- record
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(90 * time.Second)
 }
 
-func FetchHttp(ctx context.Context, url string, method string) (io.ReadCloser, int, error) {
+func FetchHttp(ctx context.Context, url string) (int, error) {
+	var data io.ReadCloser
+	status, err := GetStatusCodeHttp(ctx, url)
+	if status >= 500 {
+		data, status, _ = GetDataHttp(ctx, url, "GET")
+	}
+
+	if data != nil {
+		data.Close()
+	}
+
+	return status, err
+}
+
+func GetStatusCodeHttp(ctx context.Context, url string) (int, error) {
+	// Create an HTTP client
+	client := http.Client{}
+
+	// Create a HEAD request
+	request, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return 500, err
+	}
+
+	// Send the request
+	response, err := client.Do(request)
+	if err != nil {
+		return 500, err
+	}
+
+	return response.StatusCode, nil
+}
+
+func GetDataHttp(ctx context.Context, url string, method string) (io.ReadCloser, int, error) {
 	if method == "" {
 		method = "GET"
 	}
